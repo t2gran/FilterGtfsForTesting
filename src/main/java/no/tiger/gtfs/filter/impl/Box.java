@@ -40,6 +40,10 @@ public class Box {
         return String.format("%s [(%5.2f, %5.2f), (%5.2f, %5.2f)]", name, minLat, minLon, maxLat, maxLon);
     }
 
+    public String getName() {
+        return name;
+    }
+
     private static boolean between(double v, double min, double max) {
         return min <= v && v < max;
     }

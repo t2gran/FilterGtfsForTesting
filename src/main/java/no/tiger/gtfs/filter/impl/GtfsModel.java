@@ -24,46 +24,54 @@ import java.io.Serializable;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
-import static java.util.stream.Collectors.groupingBy;
 import static no.tiger.gtfs.filter.impl.Functions.mapCount;
 import static no.tiger.gtfs.filter.impl.Functions.noMatch;
 import static no.tiger.gtfs.filter.impl.Functions.setOf;
 
-public class GtfsDaoFilter implements GtfsDao {
-    private static final Logger LOG = LoggerFactory.getLogger(GtfsDaoFilter.class);
+public class GtfsModel implements GtfsDao {
+    private static final Logger LOG = LoggerFactory.getLogger(GtfsModel.class);
     private static final int QUAY_TYPE = 0;
     private static final int STATION_TYPE = 1;
 
-    private Set<Agency> agencies = new HashSet<>();
-    private Set<ServiceCalendar> calendars = new HashSet<>();
-    private Set<ServiceCalendarDate> calendarDates = new HashSet<>();
-    private Set<FeedInfo> feedInfos = new HashSet<>();
-    private Set<Route> routes = new HashSet<>();
-    private Set<Stop> stops = new HashSet<>();
-    private Set<StopTime> stopTimes = new HashSet<>();
-    private Set<Transfer> transfers = new HashSet<>();
-    private Set<Trip> trips = new HashSet<>();
+    private CountSet<FeedInfo> feedInfos = new CountSet<>("feedInfos");
+    private CountSet<Agency> agencies = new CountSet<>("agencies");
+    private CountSet<ServiceCalendar> calendars = new CountSet<>("calendars");
+    private CountSet<ServiceCalendarDate> calendarDates = new CountSet<>("calendarDates");
+    private CountSet<Route> routes = new CountSet<>("routes");
+    private CountSet<Trip> trips = new CountSet<>("trips");
+    private CountSet<StopTime> stopTimes = new CountSet<>("stopTimes");
+    private CountSet<Stop> stops = new CountSet<>("stops");
+    private CountSet<Transfer> transfers = new CountSet<>("transfers");
+    private List<CountSet<?>> sets = Arrays.asList(
+            feedInfos, agencies, calendars, calendarDates, routes, trips, stopTimes, stops, transfers
+    );
 
-    public void init(GtfsDao dao) {
+    private boolean cleanupChanges;
+
+    public GtfsModel(GtfsDao dao) {
+        this.feedInfos.addAll(dao.getAllFeedInfos());
         this.agencies.addAll(dao.getAllAgencies());
         this.calendars.addAll(dao.getAllCalendars());
         this.calendarDates.addAll(dao.getAllCalendarDates());
-        this.feedInfos.addAll(dao.getAllFeedInfos());
         this.routes.addAll(dao.getAllRoutes());
-        this.stops.addAll(dao.getAllStops());
-        this.stopTimes.addAll(dao.getAllStopTimes());
-        this.transfers.addAll(dao.getAllTransfers());
         this.trips.addAll(dao.getAllTrips());
+        this.stopTimes.addAll(dao.getAllStopTimes());
+        this.stops.addAll(dao.getAllStops());
+        this.transfers.addAll(dao.getAllTransfers());
+        sets.forEach(CountSet::resetChangeTracking);
     }
 
     /**
      * Set end date for all calendar services
      */
     public void setServiceEndDate(int year, int mnd, int day) {
+        LOG.info("Set service end date to {}-{}-{}", year, mnd, day);
         ServiceDate endDate = new ServiceDate(year, mnd, day);
         calendars.forEach(c -> c.setEndDate(endDate));
     }
@@ -73,9 +81,10 @@ public class GtfsDaoFilter implements GtfsDao {
      * cascade removal: Agency > Route > Trip > StopTimes
      */
     public void retainAgencies(String ... includeNames) {
-        LOG.info("Remove all routes except: " + Arrays.toString(includeNames));
+        LOG.info("Remove all agencies except: " + Arrays.toString(includeNames));
         agencies.removeIf(noMatch(Agency::getName, includeNames));
         cascadeAgenciesDeleted();
+        summary();
     }
 
     /**
@@ -86,6 +95,7 @@ public class GtfsDaoFilter implements GtfsDao {
         LOG.info("Remove all routes except: " + Arrays.toString(includeShortNames));
         routes.removeIf(noMatch(Route::getShortName, includeShortNames));
         cascadeRoutesDeleted();
+        summary();
     }
 
     /**
@@ -94,6 +104,7 @@ public class GtfsDaoFilter implements GtfsDao {
     public void retainStops(Box box) {
         LOG.info("Remove stops outside box: " + box);
         stops.removeIf(box::outside);
+        summary();
     }
 
     /**
@@ -104,27 +115,50 @@ public class GtfsDaoFilter implements GtfsDao {
      * - Remove all Stops without StopTimes
      */
     public void cleanupAll() {
-        LOG.info("Remove all StopTimes where there is no Stops");
-        stopTimes.removeIf(st -> !stops.contains(st.getStop()));
+        boolean changes = true;
+        while (changes) {
+            LOG.info("Remove all StopTimes where there is no Stops");
+            stopTimes.removeIf(st -> !stops.contains(st.getStop()));
+            changes = summary();
 
-        LOG.info("Remove all Trips with 0 or 1 StopTime (cascade to StopTimes)");
-        Map<Trip, Integer> tripCount = mapCount(stopTimes, StopTime::getTrip);
-        trips.removeIf(t -> tripCount.getOrDefault(t, 0) < 2);
+            LOG.info("Remove all Trips with 0 or 1 StopTime (cascade to StopTimes)");
+            Map<Trip, Integer> tripCount = mapCount(stopTimes, StopTime::getTrip);
+            trips.removeIf(t -> tripCount.getOrDefault(t, 0) < 2);
+            cascadeTripsDeleted();
+            changes |= summary();
 
-        LOG.info("Remove Routes without Trips");
-        Set<Route> routesInTrips = setOf(trips, Trip::getRoute);
-        routes.removeIf(r -> !routesInTrips.contains(r));
+            LOG.info("Remove all Routes without Trips");
+            Set<Route> routesInTrips = setOf(trips, Trip::getRoute);
+            routes.removeIf(r -> !routesInTrips.contains(r));
+            changes |= summary();
 
-        LOG.info("Remove Services without Trips");
-        Set<AgencyAndId> serviceIdsInTrips = setOf(trips, Trip::getServiceId);
-        calendars.removeIf(c -> !serviceIdsInTrips.contains(c.getServiceId()));
-        calendarDates.removeIf(c -> !serviceIdsInTrips.contains(c.getServiceId()));
+            LOG.info("Remove all Services without Trips");
+            Set<AgencyAndId> serviceIdsInTrips = setOf(trips, Trip::getServiceId);
+            calendars.removeIf(c -> !serviceIdsInTrips.contains(c.getServiceId()));
+            calendarDates.removeIf(c -> !serviceIdsInTrips.contains(c.getServiceId()));
+            changes |= summary();
 
-        LOG.info("Remove all Stops without StopTimes");
-        Set<Stop> stopInTrips = setOf(stopTimes, StopTime::getStop);
-        stops.removeIf(s -> isQuay(s) && !stopInTrips.contains(s));
-        Set<String> parentStops = setOf(stops, Stop::getParentStation);
-        stops.removeIf(s -> isStation(s) && !parentStops.contains(s.getId().getId()));
+            LOG.info("Remove all Stops with missing ParentStation");
+            Set<Stop> parentStations = stops.stream().filter(this::isStation).collect(Collectors.toSet());
+            Set<String> parentStationIds = setOf(parentStations, s -> s.getId().getId());
+            stops.removeIf(quayParentRefIsMissing(parentStationIds));
+            changes |= summary();
+
+            LOG.info("Remove all Stops without StopTimes");
+            Set<Stop> stopInTrips = setOf(stopTimes, StopTime::getStop);
+            stops.removeIf(s -> isStopQuay(s) && !stopInTrips.contains(s));
+            Set<String> parentStationRefs = setOf(stops, Stop::getParentStation);
+            stops.removeIf(s -> isStation(s) && !parentStationRefs.contains(s.getId().getId()));
+            changes |= summary();
+
+            LOG.info("Remove StopTimes without Trip");
+            stopTimes.removeIf(st -> !trips.contains(st.getTrip()));
+            changes |= summary();
+
+            LOG.info("Remove Transfers without Stop, Route or Trip");
+            transfers.removeIf(this::transferRefMissing);
+            changes |= summary();
+        }
     }
 
     private void cascadeAgenciesDeleted() {
@@ -141,9 +175,47 @@ public class GtfsDaoFilter implements GtfsDao {
         stopTimes.removeIf(s -> !trips.contains(s.getTrip()));
     }
 
-    private boolean isQuay(Stop stop) { return stop.getLocationType() == QUAY_TYPE; }
+    private boolean summary() {
+        boolean changed = false;
+        for (CountSet<?> set : sets) {
+            changed |= set.logChanged();
+        }
+        return changed;
+    }
+
+    private Predicate<Stop> quayParentRefIsMissing(Set<String> parentStationIds) {
+        return s -> {
+            // Skip if not Quay or optional parent station not set.
+            if(!isStopQuay(s) || isEmpty(s.getParentStation())) {
+                return false;
+            }
+            return !parentStationIds.contains(s.getParentStation());
+        };
+    }
+
+    private boolean transferRefMissing(Transfer t) {
+        return optRefMissing(t.getFromStop(), stops)
+                || optRefMissing(t.getToStop(), stops)
+                || optRefMissing(t.getFromRoute(), routes)
+                || optRefMissing(t.getToRoute(), routes)
+                || optRefMissing(t.getFromTrip(), trips)
+                || optRefMissing(t.getToTrip(), trips)
+                ;
+    }
+
+    private static <T> boolean optRefMissing(T e, Collection<T> c) {
+        return e != null && !c.contains(e);
+    }
+
+    private boolean isStopQuay(Stop stop) { return stop.getLocationType() == QUAY_TYPE; }
+
     private boolean isStation(Stop stop) { return stop.getLocationType() == STATION_TYPE; }
 
+    private boolean isEmpty(String value) {
+        return value == null || value.length() == 0;
+    }
+
+    @SuppressWarnings("unchecked")
     @Override public <T> Collection<T> getAllEntitiesForType(Class<T> type) {
         if(type == Agency.class) return (Collection<T>) agencies;
         if(type == ServiceCalendar.class) return (Collection<T>) calendars;
